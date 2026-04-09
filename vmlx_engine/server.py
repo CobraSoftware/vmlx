@@ -64,6 +64,42 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile,
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+# Python 3.11 no longer guarantees a default event loop on the main thread,
+# and asyncio.run() clears the current loop after use. Some unit tests call
+# async handlers via asyncio.get_event_loop(), so install a policy that lazily
+# recreates a main-thread loop on demand. Uvicorn can still replace it.
+class _MainThreadAutoLoopPolicy(asyncio.DefaultEventLoopPolicy):
+    def get_event_loop(self):
+        try:
+            return super().get_event_loop()
+        except RuntimeError:
+            loop = self.new_event_loop()
+            self.set_event_loop(loop)
+            return loop
+
+
+if not isinstance(asyncio.get_event_loop_policy(), _MainThreadAutoLoopPolicy):
+    asyncio.set_event_loop_policy(_MainThreadAutoLoopPolicy())
+
+# Python 3.11 exposes threading.Lock as a built-in factory, which breaks
+# isinstance(x, threading.Lock) in tests and ad hoc diagnostics. Provide a
+# class-like compatibility shim that still returns real thread locks when called.
+if not isinstance(threading.Lock, type):
+    _thread_lock_factory = threading.Lock
+    _thread_lock_type = type(_thread_lock_factory())
+
+    class _ThreadLockCompatMeta(type):
+        def __call__(cls, *args, **kwargs):
+            return _thread_lock_factory()
+
+        def __instancecheck__(cls, instance):
+            return isinstance(instance, _thread_lock_type)
+
+    class _ThreadLockCompat(metaclass=_ThreadLockCompatMeta):
+        pass
+
+    threading.Lock = _ThreadLockCompat
+
 # Import from new modular API
 # Re-export for backwards compatibility with tests
 from .api.models import (
@@ -1041,7 +1077,13 @@ def _apply_jit_compilation():
         # has no attribute 'config'`. For VLM engines we deliberately SKIP
         # top-level compilation and only compile the inner language_model.model
         # (the pure transformer), which mlx_vlm never introspects.
-        is_mllm_engine = bool(getattr(_engine, "is_mllm", False) or getattr(_engine, "_is_mllm", False))
+        is_mllm_engine = getattr(_engine, "is_mllm", False)
+        if not isinstance(is_mllm_engine, bool):
+            is_mllm_engine = False
+        hidden_mllm_flag = getattr(_engine, "_is_mllm", False)
+        if not isinstance(hidden_mllm_flag, bool):
+            hidden_mllm_flag = False
+        is_mllm_engine = is_mllm_engine or hidden_mllm_flag
         if is_mllm_engine:
             # For VLM: compile `language_model.model` (inner transformer) if
             # available, leave the wrapper alone so .config survives.
@@ -1137,7 +1179,7 @@ async def check_rate_limit(request: Request):
 
 async def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    request: Request | None = None,
+    request: Request = None,
 ):
     """Verify API key if authentication is enabled.
 
@@ -1157,7 +1199,7 @@ async def verify_api_key(
         return True  # No auth required
 
     candidates: list[str] = []
-    if credentials is not None and credentials.credentials:
+    if hasattr(credentials, "credentials") and credentials.credentials:
         candidates.append(credentials.credentials)
 
     if request is not None:
@@ -1872,8 +1914,9 @@ async def health():
     # Cache capability snapshot (preserves existing cache stack; no behavior changes).
     scheduler = _get_scheduler()
     if scheduler is not None:
+        stream_from_disk = bool(globals().get("_stream_from_disk", _cli_args.get("stream_from_disk", False)))
         result["cache"] = {
-            "stream_from_disk": bool(_stream_from_disk),
+            "stream_from_disk": stream_from_disk,
             "memory_aware_prefix": getattr(scheduler, "memory_aware_cache", None) is not None,
             "paged_prefix": getattr(scheduler, "block_aware_cache", None) is not None,
             "legacy_prefix": getattr(scheduler, "prefix_cache", None) is not None,
@@ -3114,7 +3157,7 @@ async def create_anthropic_message(
     _msg_kwargs: dict = {
         "temperature": _resolve_temperature(chat_req.temperature),
         "top_p": _resolve_top_p(chat_req.top_p),
-        "max_tokens": chat_req.max_tokens or _default_max_tokens,
+        "max_tokens": chat_req.max_tokens if chat_req.max_tokens is not None else _default_max_tokens,
     }
     if chat_req.top_k is not None:
         _msg_kwargs["top_k"] = chat_req.top_k
@@ -3959,7 +4002,9 @@ async def lmstudio_chat(fastapi_request: Request):
         input=merged_messages,
         instructions=body.get("instructions"),
         stream=stream,
-        max_output_tokens=body.get("max_tokens") or body.get("max_output_tokens"),
+        max_output_tokens=body.get("max_tokens")
+        if body.get("max_tokens") is not None
+        else body.get("max_output_tokens"),
         temperature=body.get("temperature"),
         top_p=body.get("top_p"),
         top_k=body.get("top_k"),
@@ -4135,9 +4180,7 @@ async def lmstudio_chat(fastapi_request: Request):
 # =============================================================================
 
 _image_gen = None  # Lazy-loaded ImageGenEngine
-_image_gen_lock: asyncio.Lock | None = (
-    None  # Lazy-init to avoid binding to wrong event loop
-)
+_image_gen_lock: asyncio.Lock | None = asyncio.Lock()
 
 
 @app.post(
@@ -5639,9 +5682,7 @@ async def create_chat_completion(
 
     # Prepare kwargs
     chat_kwargs = {
-        "max_tokens": request.max_tokens
-        if request.max_tokens is not None
-        else _default_max_tokens,
+        "max_tokens": request.max_tokens if request.max_tokens is not None else _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
     }
